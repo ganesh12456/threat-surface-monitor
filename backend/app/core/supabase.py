@@ -137,6 +137,17 @@ async def get_website(website_id: str, user_id: str) -> dict | None:
         return w
     return None
 
+
+async def get_website_by_id(website_id: str) -> dict | None:
+    if supabase:
+        try:
+            res = supabase.table("websites").select("*").eq("id", website_id).execute()
+            return res.data[0] if res.data else None
+        except Exception as exc:
+            logger.warning("Supabase get_website_by_id failed: %s. Using RAM store.", exc)
+            
+    return _websites.get(str(website_id))
+
 async def create_website(website_data: dict) -> dict:
     serialized = _convert_dates(website_data)
     if supabase:

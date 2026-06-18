@@ -203,6 +203,53 @@ def create_app() -> FastAPI:
             status_code=200,
         )
 
+    @app.get(
+        f"{API_PREFIX}/status",
+        tags=["Health"],
+        summary="System integration status",
+    )
+    async def system_status() -> JSONResponse:
+        """
+        Return real-time status of all integrations (Sola MCP, Google Sheets, DB).
+        Used by the frontend Settings page to show accurate connection badges.
+        """
+        from app.core.supabase import is_supabase_configured
+        from app.services.sola_mcp import sola_mcp_service
+
+        sola_info = await sola_mcp_service.get_architecture_info()
+        sola_configured = sola_info.get("status") == "configured"
+
+        return JSONResponse(
+            content={
+                "database": {
+                    "type": "supabase" if is_supabase_configured else "in_memory",
+                    "status": "connected" if is_supabase_configured else "standalone",
+                },
+                "sola_mcp": {
+                    "configured": sola_configured,
+                    "status": "configured" if sola_configured else "standalone",
+                    "endpoint": settings.SOLA_MCP_ENDPOINT or "not set",
+                    "connected_sources": sola_info.get("connected_sources", []),
+                    "capabilities": sola_info.get("capabilities", []),
+                    "note": (
+                        "Live MCP enrichment active."
+                        if sola_configured
+                        else "Running in standalone mode. Set SOLA_MCP_CLIENT_ID and SOLA_MCP_CLIENT_SECRET in .env to enable."
+                    ),
+                },
+                "google_sheets": {
+                    "configured": bool(settings.GOOGLE_SHEETS_SPREADSHEET_ID),
+                    "status": "configured" if settings.GOOGLE_SHEETS_SPREADSHEET_ID else "not_configured",
+                },
+                "notifications": {
+                    "slack": bool(settings.SLACK_WEBHOOK_URL),
+                    "discord": bool(settings.DISCORD_WEBHOOK_URL),
+                    "smtp": bool(settings.SMTP_USER),
+                },
+            },
+            status_code=200,
+        )
+
     # -----------------------------------------------------------------------
     # Custom 404 Handler for Single Page Application (SPA) Routing
     # -----------------------------------------------------------------------

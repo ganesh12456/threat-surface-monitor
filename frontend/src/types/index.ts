@@ -138,3 +138,16 @@ export type PipelineStage =
   | 'storing'
   | 'completed'
   | 'failed';
+
+export interface Report {
+  id: string;
+  website_id?: string;
+  scan_id?: string;
+  report_type: string;
+  format: string;
+  file_path: string;
+  generated_by: string;
+  created_at: string;
+  download_url: string;
+}
+
