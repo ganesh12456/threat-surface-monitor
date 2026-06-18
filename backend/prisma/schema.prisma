@@ -1,0 +1,228 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email           String   @unique @db.VarChar(255)
+  hashed_password String   @db.VarChar(255)
+  full_name       String?  @db.VarChar(255)
+  role            String   @default("viewer") @db.VarChar(50)
+  is_active       Boolean  @default(true)
+  created_at      DateTime @default(now()) @db.Timestamptz
+  updated_at      DateTime @default(now()) @db.Timestamptz
+  websites        Website[]
+  reports         Report[]
+
+  @@map("users")
+}
+
+model Website {
+  id             String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id        String?          @db.Uuid
+  user           User?            @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  url            String           @db.VarChar(500)
+  name           String?          @db.VarChar(255)
+  description    String?          @db.Text
+  is_active      Boolean          @default(true)
+  scan_frequency String           @default("daily") @db.VarChar(50)
+  last_scan_at   DateTime?        @db.Timestamptz
+  created_at     DateTime         @default(now()) @db.Timestamptz
+  updated_at     DateTime         @default(now()) @db.Timestamptz
+  scans          Scan[]
+  findings       Finding[]
+  risk_scores    RiskScore[]
+  recommendations Recommendation[]
+  alerts         Alert[]
+  wordpress_data WordpressData[]
+  cloudflare_data CloudflareData[]
+  historical_scans HistoricalScan[]
+  reports        Report[]
+
+  @@index([user_id])
+  @@map("websites")
+}
+
+model Scan {
+  id               String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  website_id       String           @db.Uuid
+  website          Website          @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  status           String           @default("pending") @db.VarChar(50)
+  pipeline_stage   String?          @db.VarChar(100)
+  started_at       DateTime?        @db.Timestamptz
+  completed_at     DateTime?        @db.Timestamptz
+  duration_seconds Float?
+  error_message    String?          @db.Text
+  scan_metadata    Json             @default("{}")
+  created_at       DateTime         @default(now()) @db.Timestamptz
+  findings         Finding[]
+  risk_scores      RiskScore[]
+  recommendations  Recommendation[]
+  alerts           Alert[]
+  wordpress_data   WordpressData[]
+  cloudflare_data  CloudflareData[]
+  reports          Report[]
+
+  @@index([website_id])
+  @@index([status])
+  @@map("scans")
+}
+
+model Finding {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  scan_id       String    @db.Uuid
+  scan          Scan      @relation(fields: [scan_id], references: [id], onDelete: Cascade)
+  website_id    String    @db.Uuid
+  website       Website   @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  category      String    @db.VarChar(100)
+  title         String    @db.VarChar(500)
+  description   String?   @db.Text
+  severity      String?   @db.VarChar(50)
+  cvss_score    Float?
+  affected_url  String?   @db.Text
+  evidence      String?   @db.Text
+  remediation   String?   @db.Text
+  is_new        Boolean   @default(true)
+  is_fixed      Boolean   @default(false)
+  first_seen_at DateTime  @default(now()) @db.Timestamptz
+  last_seen_at  DateTime  @default(now()) @db.Timestamptz
+  created_at    DateTime  @default(now()) @db.Timestamptz
+  alerts        Alert[]
+
+  @@index([scan_id])
+  @@index([website_id])
+  @@index([severity])
+  @@map("findings")
+}
+
+model RiskScore {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  scan_id        String   @db.Uuid
+  scan           Scan     @relation(fields: [scan_id], references: [id], onDelete: Cascade)
+  website_id     String   @db.Uuid
+  website        Website  @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  score          Float
+  grade          String?  @db.VarChar(5)
+  critical_count Int      @default(0)
+  high_count     Int      @default(0)
+  medium_count   Int      @default(0)
+  low_count      Int      @default(0)
+  info_count     Int      @default(0)
+  previous_score Float?
+  score_delta    Float?
+  created_at     DateTime @default(now()) @db.Timestamptz
+
+  @@index([website_id])
+  @@map("risk_scores")
+}
+
+model Recommendation {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  scan_id           String   @db.Uuid
+  scan              Scan     @relation(fields: [scan_id], references: [id], onDelete: Cascade)
+  website_id        String   @db.Uuid
+  website           Website  @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  executive_summary String?  @db.Text
+  technical_summary String?  @db.Text
+  top_risks         Json     @default("[]")
+  business_impact   String?  @db.Text
+  remediation_steps Json     @default("[]")
+  sola_analysis     Json     @default("{}")
+  created_at        DateTime @default(now()) @db.Timestamptz
+
+  @@map("recommendations")
+}
+
+model Alert {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  website_id      String   @db.Uuid
+  website         Website  @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  scan_id         String?  @db.Uuid
+  scan            Scan?    @relation(fields: [scan_id], references: [id], onDelete: SetNull)
+  finding_id      String?  @db.Uuid
+  finding         Finding? @relation(fields: [finding_id], references: [id], onDelete: SetNull)
+  alert_type      String   @db.VarChar(100)
+  title           String   @db.VarChar(500)
+  message         String?  @db.Text
+  severity        String?  @db.VarChar(50)
+  is_acknowledged Boolean  @default(false)
+  channels_sent   Json     @default("[]")
+  created_at      DateTime @default(now()) @db.Timestamptz
+
+  @@index([website_id])
+  @@index([is_acknowledged])
+  @@map("alerts")
+}
+
+model WordpressData {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  scan_id          String   @db.Uuid
+  scan             Scan     @relation(fields: [scan_id], references: [id], onDelete: Cascade)
+  website_id       String   @db.Uuid
+  website          Website  @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  is_wordpress     Boolean  @default(false)
+  version          String?  @db.VarChar(50)
+  version_outdated Boolean  @default(false)
+  plugins          Json     @default("[]")
+  themes           Json     @default("[]")
+  vulnerabilities  Json     @default("[]")
+  created_at       DateTime @default(now()) @db.Timestamptz
+
+  @@map("wordpress_data")
+}
+
+model CloudflareData {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  scan_id              String   @db.Uuid
+  scan                 Scan     @relation(fields: [scan_id], references: [id], onDelete: Cascade)
+  website_id           String   @db.Uuid
+  website              Website  @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  is_behind_cloudflare Boolean  @default(false)
+  waf_enabled          Boolean?
+  ssl_mode             String?  @db.VarChar(50)
+  cf_ray_header        String?  @db.Text
+  dns_records          Json     @default("[]")
+  security_headers     Json     @default("{}")
+  created_at           DateTime @default(now()) @db.Timestamptz
+
+  @@map("cloudflare_data")
+}
+
+model HistoricalScan {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  website_id     String   @db.Uuid
+  website        Website  @relation(fields: [website_id], references: [id], onDelete: Cascade)
+  scan_date      DateTime @db.Date
+  risk_score     Float?
+  grade          String?  @db.VarChar(5)
+  critical_count Int      @default(0)
+  high_count     Int      @default(0)
+  medium_count   Int      @default(0)
+  low_count      Int      @default(0)
+  created_at     DateTime @default(now()) @db.Timestamptz
+
+  @@index([website_id])
+  @@index([scan_date])
+  @@map("historical_scans")
+}
+
+model Report {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  website_id   String?  @db.Uuid
+  website      Website? @relation(fields: [website_id], references: [id], onDelete: SetNull)
+  scan_id      String?  @db.Uuid
+  scan         Scan?    @relation(fields: [scan_id], references: [id], onDelete: SetNull)
+  report_type  String?  @db.VarChar(100)
+  format       String?  @db.VarChar(20)
+  file_path    String?  @db.Text
+  generated_by String?  @db.Uuid
+  user         User?    @relation(fields: [generated_by], references: [id], onDelete: SetNull)
+  created_at   DateTime @default(now()) @db.Timestamptz
+
+  @@map("reports")
+}
