@@ -128,6 +128,7 @@ def generate_executive_summary(
     }.get(grade, "UNKNOWN")
 
     # Paragraph 1 — overview
+    has_github = any(f.get("category") == "GitHub" for f in findings)
     para1 = (
         f"This security assessment of {url}, conducted on {scan_date}, assigned a risk score "
         f"of {score:.1f}/100 (Grade: {grade}), indicating an overall {risk_label} risk level. "
@@ -135,6 +136,8 @@ def generate_executive_summary(
         f"across {counts['critical']} critical, {counts['high']} high, {counts['medium']} medium, "
         f"{counts['low']} low, and {counts['informational']} informational severity categories."
     )
+    if has_github:
+        para1 += " The attack surface spans both the website deployment and the associated codebase repository."
 
     # Paragraph 2 — key concerns
     critical_high = _sorted_findings([
@@ -145,8 +148,14 @@ def generate_executive_summary(
         top_issues_str = "; ".join(top_issues)
         para2 = (
             f"The most significant findings requiring immediate attention include: {top_issues_str}. "
-            f"These findings represent exploitable attack vectors that adversaries actively target "
-            f"in opportunistic and targeted campaigns. Failure to address critical and high severity "
+            f"These findings represent exploitable attack vectors that adversaries actively target."
+        )
+        if has_github:
+            para2 += " Primary risks are outdated dependencies and potential exposed secrets detected in the codebase, alongside missing browser security protections."
+        else:
+            para2 += " Primary risks are missing browser security protections and exposed files."
+        para2 += (
+            f" Failure to address critical and high severity "
             f"issues exposes the organisation to risks including data breach, service disruption, "
             f"reputational damage, and regulatory non-compliance."
         )

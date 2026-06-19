@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import {
   Bell, Filter, CheckCircle, AlertTriangle, Clock, Globe,
@@ -8,7 +8,7 @@ import { clsx } from 'clsx';
 import { formatDistanceToNow, parseISO } from 'date-fns';
 import toast from 'react-hot-toast';
 import useStore from '@/store/useStore';
-import { alertsApi, MOCK_ALERTS } from '@/services/api';
+import { alertsApi } from '@/services/api';
 import type { Alert } from '@/types';
 
 function getSeverityDotClass(severity: string) {
@@ -124,11 +124,23 @@ function AlertCard({ alert, onAcknowledge }: { alert: Alert; onAcknowledge: (id:
 
 export default function AlertsPage() {
   const { alerts: storeAlerts, setAlerts } = useStore();
-  const alerts = storeAlerts.length > 0 ? storeAlerts : MOCK_ALERTS;
+  const alerts = storeAlerts;
 
   const [severityFilter, setSeverityFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'acknowledged'>('all');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    const fetchAlerts = async () => {
+      try {
+        const list = await alertsApi.list();
+        setAlerts(list);
+      } catch (err) {
+        console.error('Failed to load alerts:', err);
+      }
+    };
+    fetchAlerts();
+  }, [setAlerts]);
 
   const filtered = alerts.filter((a) => {
     if (severityFilter && a.severity !== severityFilter) return false;
@@ -137,22 +149,22 @@ export default function AlertsPage() {
     return true;
   });
 
-  const activeCount = alerts.filter((a) => !a.is_acknowledged).length;
-  const criticalCount = alerts.filter((a) => a.severity === 'critical' && !a.is_acknowledged).length;
-  const acknowledgedCount = alerts.filter((a) => a.is_acknowledged).length;
+  const activeCount = alerts.filter((a: Alert) => !a.is_acknowledged).length;
+  const criticalCount = alerts.filter((a: Alert) => a.severity === 'critical' && !a.is_acknowledged).length;
+  const acknowledgedCount = alerts.filter((a: Alert) => a.is_acknowledged).length;
 
   const handleAcknowledge = async (alertId: string) => {
     await alertsApi.acknowledge(alertId);
-    setAlerts(alerts.map((a) => a.id === alertId ? { ...a, is_acknowledged: true } : a));
+    setAlerts(alerts.map((a: Alert) => a.id === alertId ? { ...a, is_acknowledged: true } : a));
     toast.success('Alert acknowledged');
   };
 
   const handleBulkAcknowledge = async () => {
-    const active = alerts.filter((a) => !a.is_acknowledged);
+    const active = alerts.filter((a: Alert) => !a.is_acknowledged);
     for (const alert of active) {
       await alertsApi.acknowledge(alert.id);
     }
-    setAlerts(alerts.map((a) => ({ ...a, is_acknowledged: true })));
+    setAlerts(alerts.map((a: Alert) => ({ ...a, is_acknowledged: true })));
     toast.success(`${active.length} alerts acknowledged`);
   };
 
@@ -230,7 +242,12 @@ export default function AlertsPage() {
 
       {/* Alert list */}
       <div className="space-y-3">
-        {filtered.length === 0 ? (
+        {alerts.length === 0 ? (
+          <div className="text-center py-16 bg-cyber-surface border border-cyber-border rounded-xl">
+            <Bell className="w-12 h-12 text-cyber-text-muted/30 mx-auto mb-3" />
+            <p className="text-sm text-cyber-text-muted">No alerts yet — alerts are created when scans find critical issues.</p>
+          </div>
+        ) : filtered.length === 0 ? (
           <div className="text-center py-16 bg-cyber-surface border border-cyber-border rounded-xl">
             <CheckCircle className="w-12 h-12 text-cyber-green/40 mx-auto mb-3" />
             <p className="text-sm text-cyber-text-muted">No alerts match your filters</p>

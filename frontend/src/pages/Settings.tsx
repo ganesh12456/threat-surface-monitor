@@ -1,12 +1,14 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   User, Bell, Shield, Key, Users, Zap, Brain,
   Globe, Save, Eye, EyeOff, CheckCircle, Loader2,
+  AlertTriangle, Wifi, WifiOff, RefreshCw, Server,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import toast from 'react-hot-toast';
 import useStore from '@/store/useStore';
+import { statusApi } from '@/services/api';
 
 type Section = 'profile' | 'notifications' | 'scan' | 'integrations' | 'api' | 'team';
 
@@ -41,6 +43,24 @@ export default function Settings() {
   const [activeSection, setActiveSection] = useState<Section>('profile');
   const [saving, setSaving] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [solaMcpStatus, setSolaMcpStatus] = useState<any>(null);
+  const [statusLoading, setStatusLoading] = useState(false);
+
+  const fetchStatus = async () => {
+    setStatusLoading(true);
+    try {
+      const s = await statusApi.get();
+      setSolaMcpStatus(s.sola_mcp);
+    } catch (e) {
+      console.warn('Failed to fetch system status:', e);
+    } finally {
+      setStatusLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchStatus();
+  }, []);
 
   const [profile, setProfile] = useState({
     full_name: user?.full_name ?? 'Alex Morgan',
@@ -291,20 +311,110 @@ export default function Settings() {
                     <Brain className="w-4 h-4 text-cyber-purple" /> Integrations
                   </h2>
 
-                  <div className="bg-cyber-purple/10 border border-cyber-purple/30 rounded-xl p-4">
-                    <div className="flex items-center gap-3 mb-3">
-                      <Brain className="w-5 h-5 text-cyber-purple" />
-                      <div>
-                        <p className="text-sm font-semibold text-cyber-purple">Sola MCP Integration</p>
-                        <p className="text-xs text-cyber-text-muted">Model Context Protocol AI intelligence engine</p>
+                  {/* Sola MCP Status Card */}
+                  <div className={clsx(
+                    'border rounded-xl p-5 space-y-4',
+                    solaMcpStatus?.configured
+                      ? 'bg-cyber-purple/10 border-cyber-purple/30'
+                      : 'bg-cyber-surface-2/50 border-cyber-border'
+                  )}>
+                    {/* Header */}
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="flex items-center gap-3">
+                        <div className={clsx(
+                          'w-10 h-10 rounded-xl border flex items-center justify-center',
+                          solaMcpStatus?.configured
+                            ? 'bg-cyber-purple/20 border-cyber-purple/40'
+                            : 'bg-cyber-surface border-cyber-border'
+                        )}>
+                          <Brain className={clsx('w-5 h-5', solaMcpStatus?.configured ? 'text-cyber-purple' : 'text-cyber-text-muted')} />
+                        </div>
+                        <div>
+                          <p className="text-sm font-semibold text-cyber-text">Sola MCP Intelligence</p>
+                          <p className="text-xs text-cyber-text-muted">Model Context Protocol — AI security enrichment layer</p>
+                        </div>
                       </div>
-                      <span className="ml-auto text-xs bg-cyber-green/20 text-cyber-green border border-cyber-green/30 px-2 py-0.5 rounded-full">Connected</span>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {statusLoading ? (
+                          <Loader2 className="w-4 h-4 text-cyber-text-muted animate-spin" />
+                        ) : solaMcpStatus?.configured ? (
+                          <span className="flex items-center gap-1.5 text-xs bg-cyber-green/15 text-cyber-green border border-cyber-green/30 px-2.5 py-1 rounded-full font-semibold">
+                            <Wifi className="w-3 h-3" /> Configured
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-1.5 text-xs bg-cyber-yellow/10 text-cyber-yellow border border-cyber-yellow/30 px-2.5 py-1 rounded-full font-semibold">
+                            <WifiOff className="w-3 h-3" /> Standalone
+                          </span>
+                        )}
+                        <button
+                          onClick={fetchStatus}
+                          disabled={statusLoading}
+                          className="p-1.5 rounded-lg text-cyber-text-muted hover:text-cyber-cyan hover:bg-cyber-surface-2 transition-all"
+                          title="Refresh status"
+                        >
+                          <RefreshCw className={clsx('w-3.5 h-3.5', statusLoading && 'animate-spin')} />
+                        </button>
+                      </div>
                     </div>
-                    <input type="url" value={integrations.sola_mcp_endpoint}
-                      onChange={(e) => setIntegrations({ ...integrations, sola_mcp_endpoint: e.target.value })}
-                      className="cyber-input text-xs font-mono" />
+
+                    {/* Endpoint */}
+                    <div>
+                      <label className="block text-xs font-semibold text-cyber-text-muted uppercase tracking-wider mb-1.5 flex items-center gap-2">
+                        <Server className="w-3 h-3" /> MCP Endpoint
+                      </label>
+                      <div className="cyber-input font-mono text-xs text-cyber-text-dim bg-cyber-surface-2/50 cursor-default select-all">
+                        {solaMcpStatus?.endpoint ?? '...'}
+                      </div>
+                      <p className="text-[10px] text-cyber-text-muted mt-1">
+                        Set <code className="text-cyber-cyan">SOLA_MCP_ENDPOINT</code>,{' '}
+                        <code className="text-cyber-cyan">SOLA_MCP_CLIENT_ID</code> and{' '}
+                        <code className="text-cyber-cyan">SOLA_MCP_CLIENT_SECRET</code> in your backend <code className="text-cyber-orange">.env</code> file.
+                      </p>
+                    </div>
+
+                    {/* Connected Sources */}
+                    {solaMcpStatus?.connected_sources?.length > 0 && (
+                      <div>
+                        <p className="text-xs font-semibold text-cyber-text-muted uppercase tracking-wider mb-2">Connected Sources</p>
+                        <div className="flex flex-wrap gap-2">
+                          {solaMcpStatus.connected_sources.map((src: string) => (
+                            <span key={src} className="text-[10px] font-mono bg-cyber-surface border border-cyber-border text-cyber-text-dim px-2.5 py-1 rounded-lg">
+                              {src}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Capabilities */}
+                    {solaMcpStatus?.capabilities?.length > 0 && (
+                      <div>
+                        <p className="text-xs font-semibold text-cyber-text-muted uppercase tracking-wider mb-2">Capabilities</p>
+                        <div className="flex flex-wrap gap-2">
+                          {solaMcpStatus.capabilities.map((cap: string) => (
+                            <span key={cap} className="text-[10px] font-mono bg-cyber-purple/10 border border-cyber-purple/20 text-cyber-purple px-2.5 py-1 rounded-lg">
+                              {cap.replace(/_/g, ' ')}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Note */}
+                    {solaMcpStatus?.note && (
+                      <div className={clsx(
+                        'flex items-start gap-2 rounded-lg px-3 py-2.5 text-xs',
+                        solaMcpStatus.configured
+                          ? 'bg-cyber-green/5 border border-cyber-green/20 text-cyber-green'
+                          : 'bg-cyber-yellow/5 border border-cyber-yellow/20 text-cyber-yellow'
+                      )}>
+                        <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                        <span>{solaMcpStatus.note}</span>
+                      </div>
+                    )}
                   </div>
 
+                  {/* Google Sheets */}
                   <div>
                     <label className="block text-xs font-semibold text-cyber-text-muted uppercase tracking-wider mb-1.5 flex items-center gap-2">
                       <Globe className="w-3.5 h-3.5" /> Google Sheets ID

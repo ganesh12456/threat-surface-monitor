@@ -160,6 +160,9 @@ function AddWebsiteModal({ onClose, onAdded }: AddWebsiteModalProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const isLocalUrl = (url: string) =>
+    /localhost|127\.|0\.0\.0\.0|::1/.test(url);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!form.url.startsWith('http')) {
@@ -173,7 +176,7 @@ function AddWebsiteModal({ onClose, onAdded }: AddWebsiteModalProps) {
       toast.success('Website added successfully!');
       onClose();
     } catch {
-      setError('Failed to add website');
+      setError('Failed to add website. Check that the backend is running.');
     } finally {
       setLoading(false);
     }
@@ -205,6 +208,18 @@ function AddWebsiteModal({ onClose, onAdded }: AddWebsiteModalProps) {
             <div className="flex items-center gap-2 bg-cyber-red/10 border border-cyber-red/30 rounded-lg px-3 py-2 text-sm text-cyber-red">
               <AlertTriangle className="w-4 h-4 shrink-0" />
               {error}
+            </div>
+          )}
+          {form.url && isLocalUrl(form.url) && (
+            <div className="flex items-start gap-2 bg-cyber-yellow/10 border border-cyber-yellow/30 rounded-lg px-3 py-2.5 text-xs text-cyber-yellow">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold mb-0.5">Local address detected</p>
+                <p className="text-cyber-yellow/80">
+                  Scanning <code className="font-mono">localhost</code> or <code className="font-mono">127.x.x.x</code> will scan your own dev server, not a real website.
+                  Add an external URL like <code className="font-mono">https://example.com</code> for meaningful security results.
+                </p>
+              </div>
             </div>
           )}
           <div>

@@ -9,8 +9,8 @@ import {
 import { clsx } from 'clsx';
 import { formatDistanceToNow, parseISO, format } from 'date-fns';
 import toast from 'react-hot-toast';
-import { websiteApi, findingsApi, scanApi, riskApi, aiApi, MOCK_TREND_DATA } from '@/services/api';
-import type { Website, Finding, RiskScore, Recommendation, Scan } from '@/types';
+import { websiteApi, findingsApi, scanApi, riskApi, aiApi, dashboardApi } from '@/services/api';
+import type { Website, Finding, RiskScore, Recommendation, Scan, TrendData } from '@/types';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
 function getGradeStyle(grade: string) {
@@ -111,6 +111,7 @@ export default function WebsiteDetail() {
   const [riskScore, setRiskScore] = useState<RiskScore | null>(null);
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
   const [scans, setScans] = useState<Scan[]>([]);
+  const [trendData, setTrendData] = useState<TrendData[]>([]);
   const [activeTab, setActiveTab] = useState<TabKey>('overview');
   const [scanning, setScanning] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -131,6 +132,15 @@ export default function WebsiteDetail() {
       setRiskScore(rs);
       setRecommendation(ai);
       setScans(s);
+
+      // Load trend data for this website
+      try {
+        const trends = await dashboardApi.getTrends(30);
+        setTrendData(trends);
+      } catch {
+        setTrendData([]);
+      }
+
       setLoading(false);
     };
     loadData();
@@ -332,7 +342,7 @@ export default function WebsiteDetail() {
               <div className="bg-cyber-surface border border-cyber-border rounded-xl p-5">
                 <h3 className="text-sm font-semibold text-cyber-text mb-4">Risk Trend — Last 30 Days</h3>
                 <ResponsiveContainer width="100%" height={160}>
-                  <AreaChart data={MOCK_TREND_DATA.slice(-30)} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+                  <AreaChart data={trendData.slice(-30)} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
                     <defs>
                       <linearGradient id="wsTrend" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="5%" stopColor="#00d4ff" stopOpacity={0.3} />
@@ -350,6 +360,9 @@ export default function WebsiteDetail() {
                     <Area type="monotone" dataKey="avg_score" stroke="#00d4ff" strokeWidth={2} fill="url(#wsTrend)" dot={false} />
                   </AreaChart>
                 </ResponsiveContainer>
+                {trendData.length === 0 && (
+                  <p className="text-xs text-cyber-text-muted text-center py-4">No trend data yet — run a scan to start tracking.</p>
+                )}
               </div>
 
               {/* Recent findings preview */}
@@ -417,77 +430,118 @@ export default function WebsiteDetail() {
           )}
 
           {/* TECHNICAL TAB */}
-          {activeTab === 'technical' && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-              {[
-                {
-                  title: 'Security Headers', icon: <Shield className="w-4 h-4 text-cyber-cyan" />,
-                  items: [
-                    { label: 'Content-Security-Policy', status: false },
-                    { label: 'X-Frame-Options', status: true },
-                    { label: 'X-Content-Type-Options', status: true },
-                    { label: 'Strict-Transport-Security', status: true },
-                    { label: 'Referrer-Policy', status: false },
-                    { label: 'Permissions-Policy', status: false },
-                  ],
-                },
-                {
-                  title: 'SSL/TLS', icon: <Lock className="w-4 h-4 text-cyber-green" />,
-                  items: [
-                    { label: 'TLS 1.3', status: true },
-                    { label: 'TLS 1.2', status: true },
-                    { label: 'TLS 1.1 (deprecated)', status: false },
-                    { label: 'TLS 1.0 (vulnerable)', status: false },
-                    { label: 'HSTS Enabled', status: true },
-                    { label: 'Certificate Valid', status: true },
-                  ],
-                },
-                {
-                  title: 'DNS Records', icon: <Globe className="w-4 h-4 text-cyber-purple" />,
-                  items: [
-                    { label: 'SPF Record', status: true },
-                    { label: 'DMARC Record', status: false },
-                    { label: 'DKIM Record', status: true },
-                    { label: 'DNSSEC', status: false },
-                    { label: 'CAA Record', status: true },
-                  ],
-                },
-                {
-                  title: 'WordPress', icon: <Zap className="w-4 h-4 text-cyber-orange" />,
-                  items: [
-                    { label: 'WordPress Detected', status: true },
-                    { label: 'Core Up-to-date', status: false },
-                    { label: 'Admin URL Hidden', status: false },
-                    { label: 'Debug Mode Off', status: true },
-                    { label: 'File Editing Disabled', status: true },
-                  ],
-                },
-              ].map((section) => (
-                <div key={section.title} className="bg-cyber-surface border border-cyber-border rounded-xl overflow-hidden">
-                  <div className="flex items-center gap-2 px-5 py-3 border-b border-cyber-border">
-                    {section.icon}
-                    <h3 className="text-sm font-semibold text-cyber-text">{section.title}</h3>
+          {activeTab === 'technical' && (() => {
+            // Derive check results from actual findings
+            const hasCategory = (cat: string) => findings.some(f => f.category?.toLowerCase().includes(cat.toLowerCase()));
+            const hasFinding = (keyword: string) => findings.some(f =>
+              f.title?.toLowerCase().includes(keyword.toLowerCase()) ||
+              f.description?.toLowerCase().includes(keyword.toLowerCase())
+            );
+
+            const latestScan = scans.length > 0 ? scans[0] : null;
+            const githubMetadata = (latestScan as any)?.scan_metadata?.github;
+            const repoName = githubMetadata?.repo_name || `${website.name.split('.')[0]}-production`;
+
+            const sections = [
+              {
+                title: 'Security Headers', icon: <Shield className="w-4 h-4 text-cyber-cyan" />,
+                items: [
+                  { label: 'Content-Security-Policy', pass: !hasFinding('Content-Security-Policy') },
+                  { label: 'X-Frame-Options', pass: !hasFinding('X-Frame-Options') },
+                  { label: 'X-Content-Type-Options', pass: !hasFinding('X-Content-Type-Options') },
+                  { label: 'Strict-Transport-Security (HSTS)', pass: !hasFinding('Strict-Transport-Security') && !hasFinding('HSTS') },
+                  { label: 'Referrer-Policy', pass: !hasFinding('Referrer-Policy') },
+                  { label: 'Permissions-Policy', pass: !hasFinding('Permissions-Policy') },
+                ],
+              },
+              {
+                title: 'SSL / TLS', icon: <Lock className="w-4 h-4 text-cyber-green" />,
+                items: [
+                  { label: 'Valid Certificate', pass: !hasFinding('certificate') && !hasFinding('SSL') },
+                  { label: 'TLS 1.3 Supported', pass: !hasFinding('TLS 1.3') },
+                  { label: 'TLS 1.2 Supported', pass: !hasFinding('TLS 1.2') },
+                  { label: 'TLS 1.0/1.1 Disabled', pass: !hasFinding('TLS 1.0') && !hasFinding('TLS 1.1') },
+                  { label: 'HSTS Enabled', pass: !hasFinding('HSTS') },
+                  { label: 'Mixed Content', pass: !hasFinding('Mixed Content') },
+                ],
+              },
+              {
+                title: 'DNS Records', icon: <Globe className="w-4 h-4 text-cyber-purple" />,
+                items: [
+                  { label: 'SPF Record', pass: !hasFinding('SPF') },
+                  { label: 'DMARC Record', pass: !hasFinding('DMARC') },
+                  { label: 'DKIM Record', pass: !hasFinding('DKIM') },
+                  { label: 'DNSSEC', pass: !hasFinding('DNSSEC') },
+                  { label: 'CAA Record', pass: !hasFinding('CAA') },
+                ],
+              },
+              {
+                title: 'Cloudflare Settings', icon: <Globe className="w-4 h-4 text-cyber-cyan" />,
+                items: [
+                  { label: 'DDoS Protection Active', pass: !hasFinding('Not Behind Cloudflare') },
+                  { label: 'WAF Enabled', pass: !hasFinding('WAF Disabled') && !hasFinding('Origin IP Directly') && !hasFinding('Not Behind Cloudflare') },
+                  { label: 'Origin IP Shielded', pass: !hasFinding('Origin IP Directly Resolvable') },
+                ],
+              },
+              {
+                title: 'WordPress Deployments', icon: <Zap className="w-4 h-4 text-cyber-orange" />,
+                items: [
+                  { label: 'WordPress Core Integrity', pass: !hasFinding('WordPress Core') && !hasFinding('outdated') },
+                  { label: 'Admin Path Hidden', pass: !hasFinding('wp-admin') && !hasFinding('admin') },
+                  { label: 'Debug Mode Off', pass: !hasFinding('debug') },
+                  { label: 'File Editing Disabled', pass: !hasFinding('file edit') },
+                ],
+              },
+              {
+                title: `GitHub Repository: ${repoName}`, icon: <Zap className="w-4 h-4 text-cyber-purple" />,
+                items: [
+                  { label: 'Secrets Shield', pass: !hasFinding('GitHub Secret Exposure') },
+                  { label: 'Dependency Risks Check', pass: !hasFinding('GitHub Outdated Dependency') },
+                  { label: 'Code Ownership Defined', pass: !hasFinding('Code Ownership Risk') },
+                ],
+              },
+            ];
+
+            return (
+              <div className="space-y-4">
+                {findings.length === 0 && (
+                  <div className="bg-cyber-yellow/5 border border-cyber-yellow/20 rounded-xl px-4 py-3 text-xs text-cyber-yellow flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    No scan data available yet. Run a scan first to see technical results.
                   </div>
-                  <div className="divide-y divide-cyber-border/50">
-                    {section.items.map((item) => (
-                      <div key={item.label} className="flex items-center justify-between px-5 py-2.5">
-                        <span className="text-sm text-cyber-text-dim">{item.label}</span>
-                        {item.status ? (
-                          <span className="flex items-center gap-1 text-xs text-cyber-green font-semibold">
-                            <CheckCircle className="w-3.5 h-3.5" /> Pass
-                          </span>
-                        ) : (
-                          <span className="flex items-center gap-1 text-xs text-cyber-red font-semibold">
-                            <AlertTriangle className="w-3.5 h-3.5" /> Fail
-                          </span>
-                        )}
+                )}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                  {sections.map((section) => (
+                    <div key={section.title} className="bg-cyber-surface border border-cyber-border rounded-xl overflow-hidden">
+                      <div className="flex items-center gap-2 px-5 py-3 border-b border-cyber-border">
+                        {section.icon}
+                        <h3 className="text-sm font-semibold text-cyber-text">{section.title}</h3>
+                        <span className="ml-auto text-[10px] font-mono text-cyber-text-muted">
+                          {section.items.filter(i => i.pass).length}/{section.items.length} pass
+                        </span>
                       </div>
-                    ))}
-                  </div>
+                      <div className="divide-y divide-cyber-border/50">
+                        {section.items.map((item) => (
+                          <div key={item.label} className="flex items-center justify-between px-5 py-2.5">
+                            <span className="text-sm text-cyber-text-dim">{item.label}</span>
+                            {item.pass ? (
+                              <span className="flex items-center gap-1 text-xs text-cyber-green font-semibold">
+                                <CheckCircle className="w-3.5 h-3.5" /> Pass
+                              </span>
+                            ) : (
+                              <span className="flex items-center gap-1 text-xs text-cyber-red font-semibold">
+                                <AlertTriangle className="w-3.5 h-3.5" /> Fail
+                              </span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          )}
+              </div>
+            );
+          })()}
 
           {/* AI ANALYSIS TAB */}
           {activeTab === 'ai' && recommendation && (

@@ -19,6 +19,7 @@ from app.services.scanner.wordpress_check import check_wordpress
 from app.services.scanner.cloudflare_check import check_cloudflare
 from app.services.scanner.dns_check import check_dns
 from app.services.scanner.exposure_check import check_exposure
+from app.services.scanner.github_check import check_github
 from app.services.ai_analysis import (
     calculate_risk_score,
     generate_full_analysis,
@@ -37,6 +38,7 @@ PIPELINE_STAGES = [
     "scanning_cloudflare",
     "scanning_dns",
     "scanning_exposure",
+    "scanning_github",
     "analyzing",
     "storing",
     "completed",
@@ -266,6 +268,7 @@ class ScanOrchestrator:
             cf_result: dict = {}
             dns_result: dict = {}
             exposure_result: dict = {}
+            github_result: dict = {}
 
             async with aiohttp.ClientSession(
                 connector=connector,
@@ -287,6 +290,7 @@ class ScanOrchestrator:
                     cf_result,
                     dns_result,
                     exposure_result,
+                    github_result,
                 ) = await asyncio.gather(
                     _safe_run(check_security_headers(url, session), "headers"),
                     _safe_run(check_ssl(url), "ssl"),
@@ -295,19 +299,21 @@ class ScanOrchestrator:
                     _safe_run(check_cloudflare(url, session), "cloudflare"),
                     _safe_run(check_dns(url), "dns"),
                     _safe_run(check_exposure(url, session), "exposure"),
+                    _safe_run(check_github(url, session), "github"),
                 )
 
             # Update stages for observability
             for stage in [
                 "scanning_ssl", "scanning_admin", "scanning_wordpress",
                 "scanning_cloudflare", "scanning_dns", "scanning_exposure",
+                "scanning_github",
             ]:
                 await _update_scan_stage(scan_id, stage)
 
             # Aggregate all findings
             for result in [
                 headers_result, ssl_result, admin_result,
-                wp_result, cf_result, dns_result, exposure_result,
+                wp_result, cf_result, dns_result, exposure_result, github_result,
             ]:
                 if isinstance(result, dict):
                     all_findings.extend(result.get("findings", []))
@@ -376,6 +382,15 @@ class ScanOrchestrator:
             completed_at = datetime.now(timezone.utc)
             duration = (completed_at - started_at).total_seconds()
 
+            # Save GitHub repo info in metadata
+            scan_meta = {
+                "github": {
+                    "repo_name": github_result.get("repo_name"),
+                    "repo_url": github_result.get("repo_url"),
+                    "metadata": github_result.get("metadata", {}),
+                }
+            }
+
             await db_service.update_scan(
                 scan_id,
                 {
@@ -383,6 +398,7 @@ class ScanOrchestrator:
                     "pipeline_stage": "completed",
                     "completed_at": completed_at,
                     "duration_seconds": duration,
+                    "scan_metadata": scan_meta,
                 }
             )
             await _update_scan_stage(scan_id, "completed")

@@ -3,47 +3,77 @@ import Sidebar from './Sidebar';
 import TopBar from './TopBar';
 import { useEffect } from 'react';
 import useStore from '@/store/useStore';
-import { alertsApi, dashboardApi, websiteApi } from '@/services/api';
+import { alertsApi, dashboardApi, websiteApi, authApi } from '@/services/api';
 
 export default function Layout() {
   const { setAlerts, setDashboardStats, setWebsites, setUser } = useStore();
 
   useEffect(() => {
-    // Load initial data
     const loadData = async () => {
-      const [alerts, stats, websites] = await Promise.all([
-        alertsApi.list(),
-        dashboardApi.getStats(),
-        websiteApi.list(),
-      ]);
-      setAlerts(alerts);
-      setDashboardStats(stats);
-      setWebsites(websites);
+      try {
+        const [alerts, stats, websites] = await Promise.all([
+          alertsApi.list(),
+          dashboardApi.getStats(),
+          websiteApi.list(),
+        ]);
+        setAlerts(alerts);
+        setDashboardStats(stats);
+        setWebsites(websites);
+      } catch (err) {
+        console.error('Failed to load layout data:', err);
+      }
 
-      // Mock user from localStorage
-      const token = localStorage.getItem('auth_token');
-      if (token) {
-        setUser({
-          id: 'u1',
-          email: 'alex@threatmonitor.io',
-          full_name: 'Alex Morgan',
-          role: 'admin',
-          is_active: true,
-          created_at: new Date().toISOString(),
-        });
+      // Load real user profile
+      try {
+        const me = await authApi.me();
+        if (me) {
+          setUser({
+            id: me.id ?? me.sub ?? 'u1',
+            email: me.email ?? '',
+            full_name: me.full_name ?? me.name ?? 'User',
+            role: me.role ?? 'admin',
+            is_active: me.is_active ?? true,
+            created_at: me.created_at ?? new Date().toISOString(),
+          });
+        }
+      } catch {
+        // Auth/me not available — use token claims if available
+        const token = localStorage.getItem('auth_token');
+        if (token) {
+          try {
+            const payload = JSON.parse(atob(token.split('.')[1]));
+            setUser({
+              id: payload.sub ?? 'u1',
+              email: payload.email ?? '',
+              full_name: payload.full_name ?? payload.name ?? 'User',
+              role: payload.role ?? 'admin',
+              is_active: true,
+              created_at: new Date().toISOString(),
+            });
+          } catch {
+            // keep user null — will show fallback
+          }
+        }
       }
     };
+
     loadData();
 
-    // Refresh every 30 seconds
+    // Refresh alerts + stats every 15 seconds
     const interval = setInterval(async () => {
-      const [alerts, stats] = await Promise.all([
-        alertsApi.list(),
-        dashboardApi.getStats(),
-      ]);
-      setAlerts(alerts);
-      setDashboardStats(stats);
-    }, 30000);
+      try {
+        const [alerts, stats, websites] = await Promise.all([
+          alertsApi.list(),
+          dashboardApi.getStats(),
+          websiteApi.list(),
+        ]);
+        setAlerts(alerts);
+        setDashboardStats(stats);
+        setWebsites(websites);
+      } catch (err) {
+        console.warn('Background refresh failed:', err);
+      }
+    }, 15000);
 
     return () => clearInterval(interval);
   }, [setAlerts, setDashboardStats, setWebsites, setUser]);

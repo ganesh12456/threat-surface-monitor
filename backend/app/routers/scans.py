@@ -1,11 +1,13 @@
 """
 app/routers/scans.py
-Scan retrieval endpoints: list, detail with findings, pipeline status.
+Scan retrieval endpoints: list, detail with findings, pipeline status, WebSocket.
 """
+import asyncio
+import json
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 
 from app.core import supabase as db_service
 from app.core.security import get_current_user
@@ -268,3 +270,97 @@ async def get_pipeline_status(
         estimated_completion_seconds=max(0, (len(stages_remaining) * 5)),
     )
 
+
+@router.websocket("/{scan_id}/ws")
+async def scan_pipeline_ws(
+    scan_id: str,
+    websocket: WebSocket,
+    token: str | None = Query(default=None),
+) -> None:
+    """
+    WebSocket endpoint for real-time scan pipeline updates.
+
+    Connect with: ws://localhost:8000/api/v1/scans/{scan_id}/ws?token=<auth_token>
+
+    Streams JSON payloads every second:
+        {
+            "scan_id": "...",
+            "status": "running"|"completed"|"failed"|"pending",
+            "pipeline_stage": "scanning_headers",
+            "progress_percent": 45,
+            "stages_completed": [...],
+            "stages_remaining": [...],
+            "risk_score": 78.5,
+            "grade": "D",
+            "finding_count": 22
+        }
+
+    Closes automatically when status == "completed" or "failed".
+    """
+    await websocket.accept()
+    logger.info("WebSocket opened for scan %s", scan_id)
+
+    try:
+        while True:
+            s = await db_service.get_scan(scan_id)
+            if not s:
+                await websocket.send_text(json.dumps({"error": "Scan not found", "scan_id": scan_id}))
+                await websocket.close(code=1008)
+                return
+
+            scan_status = s.get("status", "pending")
+            current_stage = s.get("pipeline_stage") or "initializing"
+
+            try:
+                stage_index = PIPELINE_STAGES.index(current_stage)
+            except ValueError:
+                stage_index = 0
+
+            stages_completed = PIPELINE_STAGES[:stage_index]
+            stages_remaining = PIPELINE_STAGES[stage_index + 1:]
+            progress = int((stage_index / max(len(PIPELINE_STAGES) - 1, 1)) * 100)
+
+            # Fetch risk score if completed
+            risk = None
+            finding_count = 0
+            if scan_status == "completed":
+                risk = await db_service.get_risk_score_by_scan(scan_id)
+                raw_findings = await db_service.list_findings_by_scan(scan_id)
+                finding_count = len(raw_findings)
+                progress = 100
+
+            payload = {
+                "scan_id": scan_id,
+                "status": scan_status,
+                "pipeline_stage": current_stage,
+                "progress_percent": progress,
+                "stages_completed": stages_completed,
+                "stages_remaining": stages_remaining,
+                "started_at": str(s.get("started_at", "")),
+                "completed_at": str(s.get("completed_at")) if s.get("completed_at") else None,
+                "duration_seconds": s.get("duration_seconds"),
+                "risk_score": float(risk["score"]) if risk and risk.get("score") is not None else None,
+                "grade": risk.get("grade") if risk else None,
+                "finding_count": finding_count,
+                "error_message": s.get("error_message"),
+            }
+
+            await websocket.send_text(json.dumps(payload))
+
+            # Stop streaming when terminal state reached
+            if scan_status in ("completed", "failed"):
+                logger.info("WebSocket closing — scan %s reached terminal state: %s", scan_id, scan_status)
+                await asyncio.sleep(0.5)
+                await websocket.close()
+                return
+
+            await asyncio.sleep(1.5)
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected by client for scan %s", scan_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("WebSocket error for scan %s: %s", scan_id, exc)
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass

@@ -12,13 +12,7 @@ scheduler = AsyncIOScheduler()
 
 async def list_all_websites_global() -> list[dict]:
     """Fetch all websites globally across all users for scheduling scans."""
-    if supabase:
-        try:
-            res = supabase.table("websites").select("*").execute()
-            return res.data
-        except Exception as exc:
-            logger.error("Failed to query global websites for scheduler: %s", exc)
-    return list(_websites.values())
+    return await db_service.list_all_websites_global()
 
 async def trigger_scheduled_scan(website_id: str, url: str) -> None:
     """Trigger a scheduled scan task in the background."""
