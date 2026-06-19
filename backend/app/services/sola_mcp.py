@@ -63,6 +63,7 @@ class SolaMCPService:
                 "Sola Web Checker",
                 "WordPress Scanner",
                 "Cloudflare Integration",
+                "GitHub Integration",
                 "Historical Scan Data",
                 "Google Sheets Sync",
                 "DNS Security Analyser",

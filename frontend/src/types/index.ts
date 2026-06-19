@@ -102,6 +102,12 @@ export interface DashboardStats {
   security_grade: string;
   active_alerts: number;
   recent_scans_count: number;
+  connected_sources: Record<string, boolean>;
+  external_assets_count: number;
+  repositories_count: number;
+  cloudflare_zones_count: number;
+  wordpress_sites_count: number;
+  top_risks: string[];
 }
 
 export interface TrendData {
@@ -134,6 +140,7 @@ export type PipelineStage =
   | 'scanning_cloudflare'
   | 'scanning_dns'
   | 'scanning_exposure'
+  | 'scanning_github'
   | 'analyzing'
   | 'storing'
   | 'completed'

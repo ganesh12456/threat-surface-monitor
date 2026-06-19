@@ -31,6 +31,7 @@ const PIPELINE_STAGE_ORDER = [
   'scanning_cloudflare',
   'scanning_dns',
   'scanning_exposure',
+  'scanning_github',
   'analyzing',
   'storing',
   'completed',

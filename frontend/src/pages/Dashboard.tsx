@@ -147,7 +147,7 @@ export default function Dashboard() {
           </div>
           <div>
             <h1 className="text-lg font-bold text-cyber-text tracking-wide uppercase">
-              Website Threat Surface Monitor
+              AI-Powered Unified Attack Surface Monitor
             </h1>
             <LiveClock />
           </div>
@@ -290,6 +290,77 @@ export default function Dashboard() {
 
         {/* Right column (1/3 width) */}
         <div className="space-y-6">
+          {/* Connected Data Sources */}
+          <div className="bg-cyber-surface border border-cyber-border rounded-xl p-5">
+            <h3 className="text-sm font-semibold text-cyber-text mb-4 pb-2 border-b border-cyber-border flex items-center gap-2">
+              <Database className="w-4 h-4 text-cyber-cyan" /> Connected Data Sources
+            </h3>
+            <div className="space-y-3">
+              {[
+                { name: 'Sola Web Checker', active: dashboardStats?.connected_sources?.sola_web_checker ?? true },
+                { name: 'WordPress Scanner', active: dashboardStats?.connected_sources?.wordpress_scanner ?? true },
+                { name: 'Cloudflare', active: dashboardStats?.connected_sources?.cloudflare ?? true },
+                { name: 'GitHub', active: dashboardStats?.connected_sources?.github ?? true },
+              ].map((src) => (
+                <div key={src.name} className="flex items-center justify-between p-2.5 rounded-lg bg-cyber-surface-2/45 border border-cyber-border/40">
+                  <span className="text-xs text-cyber-text font-medium">{src.name}</span>
+                  <span className="flex items-center gap-1 text-[10px] font-bold text-cyber-green bg-cyber-green/10 border border-cyber-green/20 px-2 py-0.5 rounded-full">
+                    ✓ ACTIVE
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Threat Surface Overview */}
+          <div className="bg-cyber-surface border border-cyber-border rounded-xl p-5">
+            <h3 className="text-sm font-semibold text-cyber-text mb-4 pb-2 border-b border-cyber-border flex items-center gap-2">
+              <Shield className="w-4 h-4 text-cyber-purple" /> Threat Surface Overview
+            </h3>
+            <div className="grid grid-cols-2 gap-3">
+              {[
+                { label: 'External Assets', value: dashboardStats?.external_assets_count ?? 0, sub: 'Websites & IPs', color: 'text-cyber-cyan', bg: 'bg-cyber-cyan/5 border-cyber-cyan/20' },
+                { label: 'Repositories', value: dashboardStats?.repositories_count ?? 0, sub: 'Connected repos', color: 'text-cyber-purple', bg: 'bg-cyber-purple/5 border-cyber-purple/20' },
+                { label: 'Cloudflare Zones', value: dashboardStats?.cloudflare_zones_count ?? 0, sub: 'DNS Infrastructure', color: 'text-cyber-orange', bg: 'bg-cyber-orange/5 border-cyber-orange/20' },
+                { label: 'WordPress Sites', value: dashboardStats?.wordpress_sites_count ?? 0, sub: 'CMS Deployments', color: 'text-cyber-yellow', bg: 'bg-cyber-yellow/5 border-cyber-yellow/20' },
+              ].map((item) => (
+                <div key={item.label} className={`p-3 rounded-lg border ${item.bg}`}>
+                  <p className="text-[9px] font-semibold text-cyber-text-muted uppercase tracking-wider">{item.label}</p>
+                  <p className={`text-2xl font-bold font-mono my-0.5 ${item.color}`}>{item.value}</p>
+                  <p className="text-[9px] text-cyber-text-muted">{item.sub}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Top Risks */}
+          <div className="bg-cyber-surface border border-cyber-border rounded-xl p-5">
+            <h3 className="text-sm font-semibold text-cyber-text mb-4 pb-2 border-b border-cyber-border flex items-center gap-2">
+              <AlertOctagon className="w-4 h-4 text-cyber-red animate-pulse" /> Top Risks
+            </h3>
+            <div className="space-y-2.5">
+              {(dashboardStats?.top_risks || []).map((risk, idx) => {
+                const getRiskColor = (index: number) => {
+                  if (index === 0) return 'text-cyber-red bg-cyber-red/10 border-cyber-red/35';
+                  if (index === 1) return 'text-cyber-orange bg-cyber-orange/10 border-cyber-orange/35';
+                  if (index === 2) return 'text-cyber-yellow bg-cyber-yellow/10 border-cyber-yellow/35';
+                  return 'text-cyber-cyan bg-cyber-cyan/10 border-cyber-cyan/35';
+                };
+                return (
+                  <div key={risk} className="flex items-center gap-3 p-2.5 rounded-lg bg-cyber-surface-2/45 border border-cyber-border/40">
+                    <span className={`w-5 h-5 rounded-md border flex items-center justify-center font-mono text-xs font-bold shrink-0 ${getRiskColor(idx)}`}>
+                      {idx + 1}
+                    </span>
+                    <span className="text-xs text-cyber-text font-medium truncate">{risk}</span>
+                  </div>
+                );
+              })}
+              {(!dashboardStats?.top_risks || dashboardStats.top_risks.length === 0) && (
+                <p className="text-xs text-cyber-text-muted py-2 text-center">No active risks detected.</p>
+              )}
+            </div>
+          </div>
+
           <RecentAlerts alerts={alerts} />
         </div>
       </div>

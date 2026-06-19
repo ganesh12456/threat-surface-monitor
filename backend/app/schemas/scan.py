@@ -70,6 +70,7 @@ PIPELINE_STAGES = [
     "scanning_cloudflare",
     "scanning_dns",
     "scanning_exposure",
+    "scanning_github",
     "analyzing",
     "storing",
     "completed",

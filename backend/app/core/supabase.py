@@ -1,35 +1,53 @@
 """
 app/core/supabase.py
-Supabase Client SDK interface with a robust in-memory RAM database fallback.
-Bypasses local PostgreSQL database completely.
+Direct PostgreSQL connection pool integration using psycopg2.
+Bypasses Supabase Client HTTP SDK completely, utilizing direct database connections.
+Provides a robust in-memory RAM database fallback when DATABASE_URL is not set or fails.
 """
+import os
+import sys
 import logging
 import uuid
+import asyncio
+import json
 from datetime import datetime, date, timezone
 from typing import Any
 
-from supabase import create_client, Client
+from dotenv import load_dotenv
+
+# Load env variables from backend/.env relative to this file
+base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+dotenv_path = os.path.join(base_dir, ".env")
+load_dotenv(dotenv_path)
+
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.extras import RealDictCursor, Json
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Initialize client if configured
-supabase_url = settings.SUPABASE_URL
-supabase_key = settings.SUPABASE_PUBLISHABLE_KEY
-
+# Global client interface (mocked for compatibility, will remain None)
+supabase = None
 is_supabase_configured = False
 
-supabase: Client = None
-if supabase_url and supabase_key:
+# Initialize PostgreSQL pool
+db_pool = None
+is_postgres_configured = False
+
+database_url = os.getenv("DATABASE_URL")
+if database_url:
     try:
-        supabase = create_client(supabase_url, supabase_key)
+        # Standardize connection string password characters if necessary
+        db_pool = ThreadedConnectionPool(1, 20, dsn=database_url)
+        is_postgres_configured = True
         is_supabase_configured = True
-        logger.info("Supabase client initialised successfully (using Publishable Key).")
+        logger.info("PostgreSQL Threaded Connection Pool initialized successfully.")
     except Exception as exc:
-        logger.warning("Failed to initialize Supabase client: %s. Falling back to mock mode.", exc)
+        logger.warning("Failed to initialize PostgreSQL pool: %s. Falling back to mock RAM mode.", exc)
 
 # ---------------------------------------------------------------------------
-# In-Memory RAM Store (persists while the server is running)
+# In-Memory RAM Store (persists while the server is running as fallback)
 # ---------------------------------------------------------------------------
 _users = {}             # id -> user dict
 _websites = {}          # id -> website dict
@@ -42,7 +60,6 @@ _cloudflare_data = {}   # id -> cf dict
 _historical_scans = {}  # id -> historical_scan dict
 _alerts = {}            # id -> alert dict
 _reports = {}           # id -> report dict
-
 
 # Pre-seed the default demo user
 from app.core.security import hash_password
@@ -58,12 +75,96 @@ _users[_demo_user_id] = {
     "updated_at": datetime.now(timezone.utc),
 }
 
+
 # ---------------------------------------------------------------------------
-# Core DB functions
+# PostgreSQL Query Helpers
 # ---------------------------------------------------------------------------
 
+def _run_query_sync(
+    query: str,
+    params: tuple = None,
+    fetch_one: bool = False,
+    fetch_all: bool = False,
+    is_update: bool = False
+) -> Any:
+    if not db_pool:
+        raise Exception("PostgreSQL pool is not initialized.")
+    
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        if conn.closed:
+            db_pool.putconn(conn, close=True)
+            conn = db_pool.getconn()
+            
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            if is_update:
+                conn.commit()
+                try:
+                    if fetch_one:
+                        row = cur.fetchone()
+                        return dict(row) if row else None
+                    if fetch_all:
+                        return [dict(r) for r in cur.fetchall()]
+                except Exception:
+                    return None
+                return None
+            
+            if fetch_one:
+                row = cur.fetchone()
+                return dict(row) if row else None
+            if fetch_all:
+                return [dict(r) for r in cur.fetchall()]
+                
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as conn_exc:
+        logger.warning("Database connection error, retrying: %s", conn_exc)
+        if conn:
+            try:
+                db_pool.putconn(conn, close=True)
+            except Exception:
+                pass
+        
+        # Retry logic once
+        conn = db_pool.getconn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            if is_update:
+                conn.commit()
+                try:
+                    if fetch_one:
+                        row = cur.fetchone()
+                        return dict(row) if row else None
+                    if fetch_all:
+                        return [dict(r) for r in cur.fetchall()]
+                except Exception:
+                    return None
+                return None
+            if fetch_one:
+                row = cur.fetchone()
+                return dict(row) if row else None
+            if fetch_all:
+                return [dict(r) for r in cur.fetchall()]
+                
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        raise exc
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+
+async def _execute_query(query: str, params: tuple = None, fetch_one: bool = False, fetch_all: bool = False) -> Any:
+    return await asyncio.to_thread(_run_query_sync, query, params, fetch_one, fetch_all, False)
+
+
+async def _execute_update(query: str, params: tuple = None, fetch_one: bool = False, fetch_all: bool = False) -> Any:
+    return await asyncio.to_thread(_run_query_sync, query, params, fetch_one, fetch_all, True)
+
+
 def _convert_dates(data: Any) -> Any:
-    """Helper to convert dates, datetimes, and UUIDs to string for JSON serialization."""
+    """Helper to convert dates, datetimes, and UUIDs to string for JSON serialization (RAM fallback)."""
     if isinstance(data, dict):
         return {k: _convert_dates(v) for k, v in data.items()}
     elif isinstance(data, list):
@@ -74,15 +175,22 @@ def _convert_dates(data: Any) -> Any:
         return str(data)
     return data
 
+# ---------------------------------------------------------------------------
+# Core DB functions
+# ---------------------------------------------------------------------------
+
 # --- Users ---
 
 async def get_user_by_email(email: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("users").select("*").eq("email", email).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM users WHERE email = %s",
+                (email,),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_user_by_email failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_user_by_email failed: %s. Using RAM store.", exc)
     
     for u in _users.values():
         if u["email"] == email:
@@ -90,24 +198,44 @@ async def get_user_by_email(email: str) -> dict | None:
     return None
 
 async def get_user_by_id(user_id: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("users").select("*").eq("id", user_id).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM users WHERE id = %s",
+                (str(user_id),),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_user_by_id failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_user_by_id failed: %s. Using RAM store.", exc)
             
     return _users.get(str(user_id))
 
 async def create_user(user_data: dict) -> dict:
-    serialized = _convert_dates(user_data)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("users").insert(serialized).execute()
-            if res.data:
-                return res.data[0]
+            query = """
+                INSERT INTO users (id, email, hashed_password, full_name, role, is_active, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """
+            res = await _execute_update(
+                query,
+                (
+                    str(user_data["id"]),
+                    user_data["email"],
+                    user_data["hashed_password"],
+                    user_data.get("full_name"),
+                    user_data.get("role", "viewer"),
+                    user_data.get("is_active", True),
+                    user_data.get("created_at", datetime.now(timezone.utc)),
+                    user_data.get("updated_at", datetime.now(timezone.utc)),
+                ),
+                fetch_one=True
+            )
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase create_user failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres create_user failed: %s. Using RAM store.", exc)
             
     _users[str(user_data["id"])] = user_data
     return user_data
@@ -115,61 +243,104 @@ async def create_user(user_data: dict) -> dict:
 # --- Websites ---
 
 async def list_websites(user_id: str) -> list[dict]:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("websites").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
-            return res.data
+            return await _execute_query(
+                "SELECT * FROM websites WHERE user_id = %s ORDER BY created_at DESC",
+                (str(user_id),),
+                fetch_all=True
+            )
         except Exception as exc:
-            logger.warning("Supabase list_websites failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres list_websites failed: %s. Using RAM store.", exc)
             
     return [w for w in _websites.values() if str(w["user_id"]) == str(user_id)]
 
-async def get_website(website_id: str, user_id: str) -> dict | None:
-    if supabase:
+async def list_all_websites_global() -> list[dict]:
+    if is_postgres_configured:
         try:
-            res = supabase.table("websites").select("*").eq("id", website_id).eq("user_id", user_id).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query("SELECT * FROM websites", fetch_all=True)
         except Exception as exc:
-            logger.warning("Supabase get_website failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres list_all_websites_global failed: %s. Using RAM store.", exc)
+    return list(_websites.values())
+
+async def get_website(website_id: str, user_id: str) -> dict | None:
+    if is_postgres_configured:
+        try:
+            return await _execute_query(
+                "SELECT * FROM websites WHERE id = %s AND user_id = %s",
+                (str(website_id), str(user_id)),
+                fetch_one=True
+            )
+        except Exception as exc:
+            logger.warning("Postgres get_website failed: %s. Using RAM store.", exc)
             
     w = _websites.get(str(website_id))
     if w and str(w["user_id"]) == str(user_id):
         return w
     return None
 
-
 async def get_website_by_id(website_id: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("websites").select("*").eq("id", website_id).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM websites WHERE id = %s",
+                (str(website_id),),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_website_by_id failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_website_by_id failed: %s. Using RAM store.", exc)
             
     return _websites.get(str(website_id))
 
 async def create_website(website_data: dict) -> dict:
-    serialized = _convert_dates(website_data)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("websites").insert(serialized).execute()
-            if res.data:
-                return res.data[0]
+            query = """
+                INSERT INTO websites (id, user_id, url, name, description, is_active, scan_frequency, last_scan_at, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """
+            res = await _execute_update(
+                query,
+                (
+                    str(website_data["id"]),
+                    str(website_data["user_id"]) if website_data.get("user_id") else None,
+                    website_data["url"],
+                    website_data.get("name"),
+                    website_data.get("description"),
+                    website_data.get("is_active", True),
+                    website_data.get("scan_frequency", "daily"),
+                    website_data.get("last_scan_at"),
+                    website_data.get("created_at", datetime.now(timezone.utc)),
+                    website_data.get("updated_at", datetime.now(timezone.utc)),
+                ),
+                fetch_one=True
+            )
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase create_website failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres create_website failed: %s. Using RAM store.", exc)
             
     _websites[str(website_data["id"])] = website_data
     return website_data
 
 async def update_website(website_id: str, updates: dict) -> dict | None:
-    serialized = _convert_dates(updates)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("websites").update(serialized).eq("id", website_id).execute()
-            if res.data:
-                return res.data[0]
+            keys = list(updates.keys())
+            if not keys:
+                return await get_website_by_id(website_id)
+            
+            set_clause = ", ".join([f"{k} = %s" for k in keys])
+            params = [updates[k] for k in keys]
+            params.append(str(website_id))
+            
+            query = f"UPDATE websites SET {set_clause} WHERE id = %s RETURNING *"
+            res = await _execute_update(query, tuple(params), fetch_one=True)
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase update_website failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres update_website failed: %s. Using RAM store.", exc)
             
     w = _websites.get(str(website_id))
     if w:
@@ -178,12 +349,13 @@ async def update_website(website_id: str, updates: dict) -> dict | None:
     return None
 
 async def delete_website(website_id: str) -> bool:
-    if supabase:
+    if is_postgres_configured:
         try:
-            supabase.table("websites").delete().eq("id", website_id).execute()
+            # Foreign key constraints set up with onDelete: Cascade will delete child items automatically
+            await _execute_update("DELETE FROM websites WHERE id = %s", (str(website_id),))
             return True
         except Exception as exc:
-            logger.warning("Supabase delete_website failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres delete_website failed: %s. Using RAM store.", exc)
             
     # Cascade delete in RAM
     if str(website_id) in _websites:
@@ -229,27 +401,59 @@ async def delete_website(website_id: str) -> bool:
 # --- Scans ---
 
 async def create_scan(scan_data: dict) -> dict:
-    serialized = _convert_dates(scan_data)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("scans").insert(serialized).execute()
-            if res.data:
-                return res.data[0]
+            query = """
+                INSERT INTO scans (id, website_id, status, pipeline_stage, started_at, completed_at, duration_seconds, error_message, scan_metadata, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """
+            res = await _execute_update(
+                query,
+                (
+                    str(scan_data["id"]),
+                    str(scan_data["website_id"]),
+                    scan_data.get("status", "pending"),
+                    scan_data.get("pipeline_stage"),
+                    scan_data.get("started_at"),
+                    scan_data.get("completed_at"),
+                    scan_data.get("duration_seconds"),
+                    scan_data.get("error_message"),
+                    Json(scan_data.get("scan_metadata", {})),
+                    scan_data.get("created_at", datetime.now(timezone.utc)),
+                ),
+                fetch_one=True
+            )
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase create_scan failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres create_scan failed: %s. Using RAM store.", exc)
             
     _scans[str(scan_data["id"])] = scan_data
     return scan_data
 
 async def update_scan(scan_id: str, updates: dict) -> dict | None:
-    serialized = _convert_dates(updates)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("scans").update(serialized).eq("id", scan_id).execute()
-            if res.data:
-                return res.data[0]
+            keys = list(updates.keys())
+            if not keys:
+                return await get_scan(scan_id)
+            
+            set_clause = ", ".join([f"{k} = %s" for k in keys])
+            params = []
+            for k in keys:
+                val = updates[k]
+                if k == "scan_metadata":
+                    val = Json(val)
+                params.append(val)
+            params.append(str(scan_id))
+            
+            query = f"UPDATE scans SET {set_clause} WHERE id = %s RETURNING *"
+            res = await _execute_update(query, tuple(params), fetch_one=True)
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase update_scan failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres update_scan failed: %s. Using RAM store.", exc)
             
     s = _scans.get(str(scan_id))
     if s:
@@ -258,32 +462,41 @@ async def update_scan(scan_id: str, updates: dict) -> dict | None:
     return None
 
 async def get_scan(scan_id: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("scans").select("*").eq("id", scan_id).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM scans WHERE id = %s",
+                (str(scan_id),),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_scan failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_scan failed: %s. Using RAM store.", exc)
             
     return _scans.get(str(scan_id))
 
 async def list_scans_by_website(website_id: str) -> list[dict]:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("scans").select("*").eq("website_id", website_id).order("created_at", desc=True).execute()
-            return res.data
+            return await _execute_query(
+                "SELECT * FROM scans WHERE website_id = %s ORDER BY created_at DESC",
+                (str(website_id),),
+                fetch_all=True
+            )
         except Exception as exc:
-            logger.warning("Supabase list_scans_by_website failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres list_scans_by_website failed: %s. Using RAM store.", exc)
             
     return [s for s in _scans.values() if str(s["website_id"]) == str(website_id)]
 
 async def get_latest_completed_scan(website_id: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("scans").select("*").eq("website_id", website_id).eq("status", "completed").order("created_at", desc=True).limit(1).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM scans WHERE website_id = %s AND status = 'completed' ORDER BY created_at DESC LIMIT 1",
+                (str(website_id),),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_latest_completed_scan failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_latest_completed_scan failed: %s. Using RAM store.", exc)
             
     scans = [s for s in _scans.values() if str(s["website_id"]) == str(website_id) and s.get("status") == "completed"]
     if not scans:
@@ -294,29 +507,64 @@ async def get_latest_completed_scan(website_id: str) -> dict | None:
 # --- Findings ---
 
 async def create_findings(findings_list: list[dict]) -> list[dict]:
-    serialized = _convert_dates(findings_list)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("findings").insert(serialized).execute()
-            if res.data:
-                return res.data
+            inserted = []
+            for f in findings_list:
+                query = """
+                    INSERT INTO findings (id, scan_id, website_id, category, title, description, severity, cvss_score, affected_url, evidence, remediation, is_new, is_fixed, first_seen_at, last_seen_at, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                """
+                res = await _execute_update(
+                    query,
+                    (
+                        str(f["id"]),
+                        str(f["scan_id"]),
+                        str(f["website_id"]),
+                        f.get("category", "General"),
+                        f.get("title", "Untitled Finding")[:500],
+                        f.get("description"),
+                        f.get("severity", "informational"),
+                        f.get("cvss_score"),
+                        f.get("affected_url"),
+                        f.get("evidence"),
+                        f.get("remediation"),
+                        f.get("is_new", True),
+                        f.get("is_fixed", False),
+                        f.get("first_seen_at", datetime.now(timezone.utc)),
+                        f.get("last_seen_at", datetime.now(timezone.utc)),
+                        f.get("created_at", datetime.now(timezone.utc)),
+                    ),
+                    fetch_one=True
+                )
+                if res:
+                    inserted.append(res)
+            return inserted
         except Exception as exc:
-            logger.warning("Supabase create_findings failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres create_findings failed: %s. Using RAM store.", exc)
             
     for f in findings_list:
         _findings[str(f["id"])] = f
     return findings_list
 
 async def list_findings_by_website(website_id: str, severity: str | None = None) -> list[dict]:
-    if supabase:
+    if is_postgres_configured:
         try:
-            q = supabase.table("findings").select("*").eq("website_id", website_id)
             if severity:
-                q = q.eq("severity", severity)
-            res = q.execute()
-            return res.data
+                return await _execute_query(
+                    "SELECT * FROM findings WHERE website_id = %s AND severity = %s",
+                    (str(website_id), severity),
+                    fetch_all=True
+                )
+            else:
+                return await _execute_query(
+                    "SELECT * FROM findings WHERE website_id = %s",
+                    (str(website_id),),
+                    fetch_all=True
+                )
         except Exception as exc:
-            logger.warning("Supabase list_findings_by_website failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres list_findings_by_website failed: %s. Using RAM store.", exc)
             
     res = [f for f in _findings.values() if str(f["website_id"]) == str(website_id)]
     if severity:
@@ -324,17 +572,38 @@ async def list_findings_by_website(website_id: str, severity: str | None = None)
     return res
 
 async def list_findings_by_scan(scan_id: str) -> list[dict]:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("findings").select("*").eq("scan_id", scan_id).execute()
-            return res.data
+            return await _execute_query(
+                "SELECT * FROM findings WHERE scan_id = %s",
+                (str(scan_id),),
+                fetch_all=True
+            )
         except Exception as exc:
-            logger.warning("Supabase list_findings_by_scan failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres list_findings_by_scan failed: %s. Using RAM store.", exc)
             
     return [f for f in _findings.values() if str(f["scan_id"]) == str(scan_id)]
 
 async def get_latest_finding_counts(website_id: str) -> dict[str, int]:
-    """Return finding counts by severity from the latest completed scan of the website."""
+    if is_postgres_configured:
+        try:
+            query = """
+                SELECT f.severity, COUNT(*) as count 
+                FROM findings f
+                JOIN scans s ON f.scan_id = s.id
+                WHERE s.website_id = %s AND s.status = 'completed'
+                GROUP BY f.severity
+            """
+            rows = await _execute_query(query, (str(website_id),), fetch_all=True)
+            counts = {}
+            for r in rows:
+                sev = r["severity"]
+                if sev:
+                    counts[sev] = int(r["count"])
+            return counts
+        except Exception as exc:
+            logger.warning("Postgres get_latest_finding_counts failed: %s. Using RAM store.", exc)
+            
     scan = await get_latest_completed_scan(website_id)
     if not scan:
         return {}
@@ -349,25 +618,50 @@ async def get_latest_finding_counts(website_id: str) -> dict[str, int]:
 # --- Risk Scores ---
 
 async def create_risk_score(risk_score_data: dict) -> dict:
-    serialized = _convert_dates(risk_score_data)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("risk_scores").insert(serialized).execute()
-            if res.data:
-                return res.data[0]
+            query = """
+                INSERT INTO risk_scores (id, scan_id, website_id, score, grade, critical_count, high_count, medium_count, low_count, info_count, previous_score, score_delta, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """
+            res = await _execute_update(
+                query,
+                (
+                    str(risk_score_data["id"]),
+                    str(risk_score_data["scan_id"]),
+                    str(risk_score_data["website_id"]),
+                    float(risk_score_data["score"]),
+                    risk_score_data.get("grade"),
+                    risk_score_data.get("critical_count", 0),
+                    risk_score_data.get("high_count", 0),
+                    risk_score_data.get("medium_count", 0),
+                    risk_score_data.get("low_count", 0),
+                    risk_score_data.get("info_count", 0),
+                    risk_score_data.get("previous_score"),
+                    risk_score_data.get("score_delta"),
+                    risk_score_data.get("created_at", datetime.now(timezone.utc)),
+                ),
+                fetch_one=True
+            )
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase create_risk_score failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres create_risk_score failed: %s. Using RAM store.", exc)
             
     _risk_scores[str(risk_score_data["id"])] = risk_score_data
     return risk_score_data
 
 async def get_latest_risk_score(website_id: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("risk_scores").select("*").eq("website_id", website_id).order("created_at", desc=True).limit(1).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM risk_scores WHERE website_id = %s ORDER BY created_at DESC LIMIT 1",
+                (str(website_id),),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_latest_risk_score failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_latest_risk_score failed: %s. Using RAM store.", exc)
             
     scores = [s for s in _risk_scores.values() if str(s["website_id"]) == str(website_id)]
     if not scores:
@@ -378,25 +672,47 @@ async def get_latest_risk_score(website_id: str) -> dict | None:
 # --- Recommendations ---
 
 async def create_recommendations(rec_data: dict) -> dict:
-    serialized = _convert_dates(rec_data)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("recommendations").insert(serialized).execute()
-            if res.data:
-                return res.data[0]
+            query = """
+                INSERT INTO recommendations (id, scan_id, website_id, executive_summary, technical_summary, top_risks, business_impact, remediation_steps, sola_analysis, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """
+            res = await _execute_update(
+                query,
+                (
+                    str(rec_data["id"]),
+                    str(rec_data["scan_id"]),
+                    str(rec_data["website_id"]),
+                    rec_data.get("executive_summary"),
+                    rec_data.get("technical_summary"),
+                    Json(rec_data.get("top_risks", [])),
+                    rec_data.get("business_impact"),
+                    Json(rec_data.get("remediation_steps", [])),
+                    Json(rec_data.get("sola_analysis", {})),
+                    rec_data.get("created_at", datetime.now(timezone.utc)),
+                ),
+                fetch_one=True
+            )
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase create_recommendations failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres create_recommendations failed: %s. Using RAM store.", exc)
             
     _recommendations[str(rec_data["id"])] = rec_data
     return rec_data
 
 async def get_recommendations(website_id: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("recommendations").select("*").eq("website_id", website_id).order("created_at", desc=True).limit(1).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM recommendations WHERE website_id = %s ORDER BY created_at DESC LIMIT 1",
+                (str(website_id),),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_recommendations failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_recommendations failed: %s. Using RAM store.", exc)
             
     recs = [r for r in _recommendations.values() if str(r["website_id"]) == str(website_id)]
     if not recs:
@@ -407,25 +723,47 @@ async def get_recommendations(website_id: str) -> dict | None:
 # --- WordPress Data ---
 
 async def create_wordpress_data(wp_data: dict) -> dict:
-    serialized = _convert_dates(wp_data)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("wordpress_data").insert(serialized).execute()
-            if res.data:
-                return res.data[0]
+            query = """
+                INSERT INTO wordpress_data (id, scan_id, website_id, is_wordpress, version, version_outdated, plugins, themes, vulnerabilities, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """
+            res = await _execute_update(
+                query,
+                (
+                    str(wp_data["id"]),
+                    str(wp_data["scan_id"]),
+                    str(wp_data["website_id"]),
+                    wp_data.get("is_wordpress", False),
+                    wp_data.get("version"),
+                    wp_data.get("version_outdated", False),
+                    Json(wp_data.get("plugins", [])),
+                    Json(wp_data.get("themes", [])),
+                    Json(wp_data.get("vulnerabilities", [])),
+                    wp_data.get("created_at", datetime.now(timezone.utc)),
+                ),
+                fetch_one=True
+            )
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase create_wordpress_data failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres create_wordpress_data failed: %s. Using RAM store.", exc)
             
     _wordpress_data[str(wp_data["id"])] = wp_data
     return wp_data
 
 async def get_wordpress_data(website_id: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("wordpress_data").select("*").eq("website_id", website_id).order("created_at", desc=True).limit(1).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM wordpress_data WHERE website_id = %s ORDER BY created_at DESC LIMIT 1",
+                (str(website_id),),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_wordpress_data failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_wordpress_data failed: %s. Using RAM store.", exc)
             
     wp = [w for w in _wordpress_data.values() if str(w["website_id"]) == str(website_id)]
     if not wp:
@@ -436,25 +774,47 @@ async def get_wordpress_data(website_id: str) -> dict | None:
 # --- Cloudflare Data ---
 
 async def create_cloudflare_data(cf_data: dict) -> dict:
-    serialized = _convert_dates(cf_data)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("cloudflare_data").insert(serialized).execute()
-            if res.data:
-                return res.data[0]
+            query = """
+                INSERT INTO cloudflare_data (id, scan_id, website_id, is_behind_cloudflare, waf_enabled, ssl_mode, cf_ray_header, dns_records, security_headers, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """
+            res = await _execute_update(
+                query,
+                (
+                    str(cf_data["id"]),
+                    str(cf_data["scan_id"]),
+                    str(cf_data["website_id"]),
+                    cf_data.get("is_behind_cloudflare", False),
+                    cf_data.get("waf_enabled"),
+                    cf_data.get("ssl_mode"),
+                    cf_data.get("cf_ray_header"),
+                    Json(cf_data.get("dns_records", [])),
+                    Json(cf_data.get("security_headers", {})),
+                    cf_data.get("created_at", datetime.now(timezone.utc)),
+                ),
+                fetch_one=True
+            )
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase create_cloudflare_data failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres create_cloudflare_data failed: %s. Using RAM store.", exc)
             
     _cloudflare_data[str(cf_data["id"])] = cf_data
     return cf_data
 
 async def get_cloudflare_data(website_id: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("cloudflare_data").select("*").eq("website_id", website_id).order("created_at", desc=True).limit(1).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM cloudflare_data WHERE website_id = %s ORDER BY created_at DESC LIMIT 1",
+                (str(website_id),),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_cloudflare_data failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_cloudflare_data failed: %s. Using RAM store.", exc)
             
     cf = [c for c in _cloudflare_data.values() if str(c["website_id"]) == str(website_id)]
     if not cf:
@@ -465,75 +825,128 @@ async def get_cloudflare_data(website_id: str) -> dict | None:
 # --- Historical Scans ---
 
 async def create_historical_scan(hist_data: dict) -> dict:
-    serialized = _convert_dates(hist_data)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("historical_scans").insert(serialized).execute()
-            if res.data:
-                return res.data[0]
+            query = """
+                INSERT INTO historical_scans (id, website_id, scan_date, risk_score, grade, critical_count, high_count, medium_count, low_count, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """
+            s_date = hist_data.get("scan_date")
+            if isinstance(s_date, str):
+                s_date = date.fromisoformat(s_date)
+                
+            res = await _execute_update(
+                query,
+                (
+                    str(hist_data["id"]),
+                    str(hist_data["website_id"]),
+                    s_date,
+                    float(hist_data["risk_score"]) if hist_data.get("risk_score") is not None else None,
+                    hist_data.get("grade"),
+                    hist_data.get("critical_count", 0),
+                    hist_data.get("high_count", 0),
+                    hist_data.get("medium_count", 0),
+                    hist_data.get("low_count", 0),
+                    hist_data.get("created_at", datetime.now(timezone.utc)),
+                ),
+                fetch_one=True
+            )
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase create_historical_scan failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres create_historical_scan failed: %s. Using RAM store.", exc)
             
     _historical_scans[str(hist_data["id"])] = hist_data
     return hist_data
 
 async def list_historical_scans(website_id: str, days: int = 30) -> list[dict]:
-    if supabase:
+    if is_postgres_configured:
         try:
-            # Query historical scans for the website
-            res = supabase.table("historical_scans").select("*").eq("website_id", website_id).order("scan_date", desc=False).execute()
-            # Filter manually or by date if possible
-            # Postgrest doesn't easily support raw intervals, so we select recent rows
-            return res.data
+            return await _execute_query(
+                "SELECT * FROM historical_scans WHERE website_id = %s ORDER BY scan_date ASC",
+                (str(website_id),),
+                fetch_all=True
+            )
         except Exception as exc:
-            logger.warning("Supabase list_historical_scans failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres list_historical_scans failed: %s. Using RAM store.", exc)
             
     return [h for h in _historical_scans.values() if str(h["website_id"]) == str(website_id)]
 
 # --- Alerts ---
 
 async def create_alert(alert_data: dict) -> dict:
-    serialized = _convert_dates(alert_data)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("alerts").insert(serialized).execute()
-            if res.data:
-                return res.data[0]
+            query = """
+                INSERT INTO alerts (id, website_id, scan_id, finding_id, alert_type, title, message, severity, is_acknowledged, channels_sent, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """
+            res = await _execute_update(
+                query,
+                (
+                    str(alert_data["id"]),
+                    str(alert_data["website_id"]),
+                    str(alert_data["scan_id"]) if alert_data.get("scan_id") else None,
+                    str(alert_data["finding_id"]) if alert_data.get("finding_id") else None,
+                    alert_data["alert_type"],
+                    alert_data["title"][:500],
+                    alert_data.get("message"),
+                    alert_data.get("severity"),
+                    alert_data.get("is_acknowledged", False),
+                    Json(alert_data.get("channels_sent", [])),
+                    alert_data.get("created_at", datetime.now(timezone.utc)),
+                ),
+                fetch_one=True
+            )
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase create_alert failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres create_alert failed: %s. Using RAM store.", exc)
             
     _alerts[str(alert_data["id"])] = alert_data
     return alert_data
 
 async def list_alerts(user_id: str) -> list[dict]:
-    if supabase:
+    if is_postgres_configured:
         try:
-            # Postgrest join: select alerts for user's websites
-            res = supabase.table("alerts").select("*, websites!inner(user_id)").eq("websites.user_id", user_id).execute()
-            # Clean up the embedded object
-            alerts_list = []
-            for r in res.data:
-                alert_copy = r.copy()
-                if "websites" in alert_copy:
-                    del alert_copy["websites"]
-                alerts_list.append(alert_copy)
-            return alerts_list
+            query = """
+                SELECT a.* 
+                FROM alerts a
+                JOIN websites w ON a.website_id = w.id
+                WHERE w.user_id = %s
+                ORDER BY a.created_at DESC
+            """
+            return await _execute_query(query, (str(user_id),), fetch_all=True)
         except Exception as exc:
-            logger.warning("Supabase list_alerts failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres list_alerts failed: %s. Using RAM store.", exc)
             
-    # RAM fallback: join with websites
     user_website_ids = {str(w["id"]) for w in _websites.values() if str(w["user_id"]) == str(user_id)}
     return [a for a in _alerts.values() if str(a["website_id"]) in user_website_ids]
 
 async def update_alert(alert_id: str, updates: dict) -> dict | None:
-    serialized = _convert_dates(updates)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("alerts").update(serialized).eq("id", alert_id).execute()
-            if res.data:
-                return res.data[0]
+            keys = list(updates.keys())
+            if not keys:
+                return await _execute_query("SELECT * FROM alerts WHERE id = %s", (str(alert_id),), fetch_one=True)
+            
+            set_clause = ", ".join([f"{k} = %s" for k in keys])
+            params = []
+            for k in keys:
+                val = updates[k]
+                if k == "channels_sent":
+                    val = Json(val)
+                params.append(val)
+            params.append(str(alert_id))
+            
+            query = f"UPDATE alerts SET {set_clause} WHERE id = %s RETURNING *"
+            res = await _execute_update(query, tuple(params), fetch_one=True)
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase update_alert failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres update_alert failed: %s. Using RAM store.", exc)
             
     a = _alerts.get(str(alert_id))
     if a:
@@ -542,63 +955,75 @@ async def update_alert(alert_id: str, updates: dict) -> dict | None:
     return None
 
 async def delete_alert(alert_id: str) -> bool:
-    if supabase:
+    if is_postgres_configured:
         try:
-            supabase.table("alerts").delete().eq("id", alert_id).execute()
+            await _execute_update("DELETE FROM alerts WHERE id = %s", (str(alert_id),))
             return True
         except Exception as exc:
-            logger.warning("Supabase delete_alert failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres delete_alert failed: %s. Using RAM store.", exc)
             
     if str(alert_id) in _alerts:
         del _alerts[str(alert_id)]
         return True
     return False
 
-
 # --- Custom Scan details ---
 
 async def get_risk_score_by_scan(scan_id: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("risk_scores").select("*").eq("scan_id", scan_id).order("created_at", desc=True).limit(1).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM risk_scores WHERE scan_id = %s ORDER BY created_at DESC LIMIT 1",
+                (str(scan_id),),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_risk_score_by_scan failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_risk_score_by_scan failed: %s. Using RAM store.", exc)
+            
     for r in _risk_scores.values():
         if str(r.get("scan_id")) == str(scan_id):
             return r
     return None
 
 async def get_recommendation_by_scan(scan_id: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("recommendations").select("*").eq("scan_id", scan_id).limit(1).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM recommendations WHERE scan_id = %s LIMIT 1",
+                (str(scan_id),),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_recommendation_by_scan failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_recommendation_by_scan failed: %s. Using RAM store.", exc)
+            
     for r in _recommendations.values():
         if str(r.get("scan_id")) == str(scan_id):
             return r
     return None
 
 async def list_scans(user_id: str, status: str | None = None, website_id: str | None = None, limit: int = 50, skip: int = 0) -> list[dict]:
-    if supabase:
+    if is_postgres_configured:
         try:
-            q = supabase.table("scans").select("*, websites!inner(user_id)").eq("websites.user_id", user_id)
+            query = """
+                SELECT s.* 
+                FROM scans s
+                JOIN websites w ON s.website_id = w.id
+                WHERE w.user_id = %s
+            """
+            params = [str(user_id)]
             if website_id:
-                q = q.eq("website_id", website_id)
+                query += " AND s.website_id = %s"
+                params.append(str(website_id))
             if status:
-                q = q.eq("status", status)
-            res = q.order("created_at", desc=True).range(skip, skip + limit - 1).execute()
-            scans_list = []
-            for r in res.data:
-                copy_s = r.copy()
-                if "websites" in copy_s:
-                    del copy_s["websites"]
-                scans_list.append(copy_s)
-            return scans_list
+                query += " AND s.status = %s"
+                params.append(status)
+            
+            query += " ORDER BY s.created_at DESC LIMIT %s OFFSET %s"
+            params.extend([limit, skip])
+            
+            return await _execute_query(query, tuple(params), fetch_all=True)
         except Exception as exc:
-            logger.warning("Supabase list_scans failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres list_scans failed: %s. Using RAM store.", exc)
             
     website_ids = {str(w["id"]) for w in _websites.values() if str(w["user_id"]) == str(user_id)}
     res = [s for s in _scans.values() if str(s["website_id"]) in website_ids]
@@ -608,7 +1033,6 @@ async def list_scans(user_id: str, status: str | None = None, website_id: str | 
         res = [s for s in res if s.get("status") == status]
     res.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return res[skip : skip + limit]
-
 
 async def list_findings_across_websites(
     user_id: str,
@@ -621,36 +1045,51 @@ async def list_findings_across_websites(
     limit: int = 50,
     skip: int = 0
 ) -> list[dict]:
-    if supabase:
+    if is_postgres_configured:
         try:
-            q = supabase.table("findings").select("*, websites!inner(user_id)").eq("websites.user_id", user_id)
+            query = """
+                SELECT f.* 
+                FROM findings f
+                JOIN websites w ON f.website_id = w.id
+                WHERE w.user_id = %s
+            """
+            params = [str(user_id)]
             if website_id:
-                q = q.eq("website_id", website_id)
+                query += " AND f.website_id = %s"
+                params.append(str(website_id))
             if scan_id:
-                q = q.eq("scan_id", scan_id)
+                query += " AND f.scan_id = %s"
+                params.append(str(scan_id))
             if severity:
-                q = q.eq("severity", severity)
+                query += " AND f.severity = %s"
+                params.append(severity)
             if category:
-                q = q.ilike("category", f"%{category}%")
+                query += " AND f.category ILIKE %s"
+                params.append(f"%{category}%")
             if is_new is not None:
-                q = q.eq("is_new", is_new)
+                query += " AND f.is_new = %s"
+                params.append(is_new)
             if is_fixed is not None:
-                q = q.eq("is_fixed", is_fixed)
+                query += " AND f.is_fixed = %s"
+                params.append(is_fixed)
             
-            res = q.execute()
-            findings_list = []
-            for r in res.data:
-                copy_f = r.copy()
-                if "websites" in copy_f:
-                    del copy_f["websites"]
-                findings_list.append(copy_f)
-                
-            severity_order = {"critical": 1, "high": 2, "medium": 3, "low": 4, "informational": 5}
-            findings_list.sort(key=lambda x: (severity_order.get(x.get("severity", "informational"), 6), x.get("created_at", "")), reverse=True)
+            query += """
+                ORDER BY 
+                  CASE f.severity
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    WHEN 'low' THEN 4
+                    ELSE 5
+                  END ASC,
+                  f.created_at DESC
+                LIMIT %s OFFSET %s
+            """
+            params.extend([limit, skip])
             
-            return findings_list[skip : skip + limit]
+            return await _execute_query(query, tuple(params), fetch_all=True)
         except Exception as exc:
-            logger.warning("Supabase list_findings_across_websites failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres list_findings_across_websites failed: %s. Using RAM store.", exc)
             
     user_website_ids = {str(w["id"]) for w in _websites.values() if str(w["user_id"]) == str(user_id)}
     res = [f for f in _findings.values() if str(f["website_id"]) in user_website_ids]
@@ -672,48 +1111,70 @@ async def list_findings_across_websites(
     
     return res[skip : skip + limit]
 
+# --- Reports ---
 
 async def create_report(report_data: dict) -> dict:
-    serialized = _convert_dates(report_data)
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("reports").insert(serialized).execute()
-            if res.data:
-                return res.data[0]
+            query = """
+                INSERT INTO reports (id, website_id, scan_id, report_type, format, file_path, generated_by, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+            """
+            res = await _execute_update(
+                query,
+                (
+                    str(report_data["id"]),
+                    str(report_data["website_id"]) if report_data.get("website_id") else None,
+                    str(report_data["scan_id"]) if report_data.get("scan_id") else None,
+                    report_data.get("report_type"),
+                    report_data.get("format"),
+                    report_data.get("file_path"),
+                    str(report_data["generated_by"]) if report_data.get("generated_by") else None,
+                    report_data.get("created_at", datetime.now(timezone.utc)),
+                ),
+                fetch_one=True
+            )
+            if res:
+                return res
         except Exception as exc:
-            logger.warning("Supabase create_report failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres create_report failed: %s. Using RAM store.", exc)
+            
     _reports[str(report_data["id"])] = report_data
     return report_data
 
-
 async def list_reports(user_id: str, website_id: str | None = None, limit: int = 50, skip: int = 0) -> list[dict]:
-    if supabase:
+    if is_postgres_configured:
         try:
-            q = supabase.table("reports").select("*").eq("generated_by", user_id)
+            query = "SELECT * FROM reports WHERE generated_by = %s"
+            params = [str(user_id)]
             if website_id:
-                q = q.eq("website_id", website_id)
-            res = q.order("created_at", desc=True).range(skip, skip + limit - 1).execute()
-            return res.data
+                query += " AND website_id = %s"
+                params.append(str(website_id))
+            query += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+            params.extend([limit, skip])
+            return await _execute_query(query, tuple(params), fetch_all=True)
         except Exception as exc:
-            logger.warning("Supabase list_reports failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres list_reports failed: %s. Using RAM store.", exc)
+            
     res = [r for r in _reports.values() if str(r.get("generated_by")) == str(user_id)]
     if website_id:
         res = [r for r in res if str(r.get("website_id")) == str(website_id)]
     res.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return res[skip : skip + limit]
 
-
 async def get_report(report_id: str, user_id: str) -> dict | None:
-    if supabase:
+    if is_postgres_configured:
         try:
-            res = supabase.table("reports").select("*").eq("id", report_id).eq("generated_by", user_id).execute()
-            return res.data[0] if res.data else None
+            return await _execute_query(
+                "SELECT * FROM reports WHERE id = %s AND generated_by = %s",
+                (str(report_id), str(user_id)),
+                fetch_one=True
+            )
         except Exception as exc:
-            logger.warning("Supabase get_report failed: %s. Using RAM store.", exc)
+            logger.warning("Postgres get_report failed: %s. Using RAM store.", exc)
+            
     r = _reports.get(str(report_id))
     if r and str(r.get("generated_by")) == str(user_id):
         return r
     return None
-
-
-

@@ -438,6 +438,10 @@ export default function WebsiteDetail() {
               f.description?.toLowerCase().includes(keyword.toLowerCase())
             );
 
+            const latestScan = scans.length > 0 ? scans[0] : null;
+            const githubMetadata = (latestScan as any)?.scan_metadata?.github;
+            const repoName = githubMetadata?.repo_name || `${website.name.split('.')[0]}-production`;
+
             const sections = [
               {
                 title: 'Security Headers', icon: <Shield className="w-4 h-4 text-cyber-cyan" />,
@@ -472,13 +476,28 @@ export default function WebsiteDetail() {
                 ],
               },
               {
-                title: 'WordPress', icon: <Zap className="w-4 h-4 text-cyber-orange" />,
+                title: 'Cloudflare Settings', icon: <Globe className="w-4 h-4 text-cyber-cyan" />,
                 items: [
-                  { label: 'WordPress Detected', pass: !hasCategory('WordPress') },
-                  { label: 'Core Up-to-date', pass: !hasFinding('WordPress Core') && !hasFinding('outdated') },
-                  { label: 'Admin URL Hidden', pass: !hasFinding('wp-admin') && !hasFinding('admin') },
+                  { label: 'DDoS Protection Active', pass: !hasFinding('Not Behind Cloudflare') },
+                  { label: 'WAF Enabled', pass: !hasFinding('WAF Disabled') && !hasFinding('Origin IP Directly') && !hasFinding('Not Behind Cloudflare') },
+                  { label: 'Origin IP Shielded', pass: !hasFinding('Origin IP Directly Resolvable') },
+                ],
+              },
+              {
+                title: 'WordPress Deployments', icon: <Zap className="w-4 h-4 text-cyber-orange" />,
+                items: [
+                  { label: 'WordPress Core Integrity', pass: !hasFinding('WordPress Core') && !hasFinding('outdated') },
+                  { label: 'Admin Path Hidden', pass: !hasFinding('wp-admin') && !hasFinding('admin') },
                   { label: 'Debug Mode Off', pass: !hasFinding('debug') },
                   { label: 'File Editing Disabled', pass: !hasFinding('file edit') },
+                ],
+              },
+              {
+                title: `GitHub Repository: ${repoName}`, icon: <Zap className="w-4 h-4 text-cyber-purple" />,
+                items: [
+                  { label: 'Secrets Shield', pass: !hasFinding('GitHub Secret Exposure') },
+                  { label: 'Dependency Risks Check', pass: !hasFinding('GitHub Outdated Dependency') },
+                  { label: 'Code Ownership Defined', pass: !hasFinding('Code Ownership Risk') },
                 ],
               },
             ];

@@ -22,6 +22,23 @@ class DashboardStats(BaseModel):
     websites_with_critical: int = 0
     last_updated: datetime | None = None
 
+    # Connected Data Sources status
+    connected_sources: dict[str, bool] = {
+        "sola_web_checker": True,
+        "wordpress_scanner": True,
+        "cloudflare": True,
+        "github": True
+    }
+    
+    # Threat Surface Overview
+    external_assets_count: int = 0
+    repositories_count: int = 0
+    cloudflare_zones_count: int = 0
+    wordpress_sites_count: int = 0
+
+    # Top Risks
+    top_risks: list[str] = []
+
 
 class TrendPoint(BaseModel):
     """Single data point in a time-series trend."""
